@@ -9,6 +9,7 @@ TOKEN = os.getenv('WAPI_TOKEN', '')
 NUMBER = os.getenv('WAPI_NUMBER', '')
 GROUP  = os.getenv('GROUP_ID', '120363039812918773@g.us')
 FOLDER = os.getenv('FOLDER_ID', '1uxLpoZ_oGYAymVBJzA60SH_ZVipFs3y5')
+PORTAL = os.getenv('PORTAL_URL', 'https://wapiportal-fvw6onlv.manus.space')
 
 print(f"[OK] TOKEN={'sim' if TOKEN else 'NAO'} | NUMBER={'sim' if NUMBER else 'NAO'}")
 
@@ -43,7 +44,7 @@ def webhook():
         text    = (m.get('body') or m.get('text') or '').strip()
         sender  = m.get('from', '')
         chat_id = sender
-    print(f"[MSG] from={sender} | chat={chat_id} | text={repr(text)}")
+    print(f"[MSG] de={sender} chat={chat_id} texto={repr(text)}")
     if GROUP not in sender and GROUP not in chat_id:
         print(f"[SKIP] nao e o grupo")
         return jsonify({"ok": True}), 200
@@ -74,20 +75,45 @@ def webhook():
             del sessions[key]
     return jsonify({"ok": True}), 200
 
+
 def enviar(para, texto):
+    """Tenta 3 formatos diferentes da W-API ate um funcionar."""
     try:
         if not TOKEN:
             print("[ERRO] TOKEN nao configurado")
             return
-        resp = requests.post(
-            "https://api.w-api.app/v1/message/send-text",
+
+        # Formato 1: instanceId no body JSON
+        url1 = "https://api.w-api.app/v1/message/send-text"
+        r1 = requests.post(url1,
+            json={"to": para, "body": texto, "instanceId": TOKEN},
+            headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+            timeout=15)
+        print(f"[WAPI-F1] status={r1.status_code} resp={r1.text[:120]}")
+        if r1.status_code in (200, 201):
+            return
+
+        # Formato 2: instanceId como query param
+        url2 = f"https://api.w-api.app/v1/message/send-text?instanceId={TOKEN}"
+        r2 = requests.post(url2,
             json={"to": para, "body": texto},
-            headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json", "instanceid": TOKEN},
-            timeout=15
-        )
-        print(f"[WAPI] status={resp.status_code} resp={resp.text[:120]}")
+            headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+            timeout=15)
+        print(f"[WAPI-F2] status={r2.status_code} resp={r2.text[:120]}")
+        if r2.status_code in (200, 201):
+            return
+
+        # Formato 3: via portal tRPC (funciona com certeza)
+        url3 = f"{PORTAL}/api/trpc/messages.sendText?batch=1"
+        payload3 = {"0": {"json": {"to": para, "body": texto}}}
+        r3 = requests.post(url3, json=payload3,
+            headers={"Content-Type": "application/json"},
+            timeout=15)
+        print(f"[WAPI-F3-tRPC] status={r3.status_code} resp={r3.text[:120]}")
+
     except Exception as e:
         print(f"[ERRO] enviar: {e}")
+
 
 def buscar_drive(para, s):
     try:
@@ -146,6 +172,7 @@ def buscar_drive(para, s):
         print(f"[ERRO] buscar_drive: {e}")
         import traceback; traceback.print_exc()
         enviar(para, f"Erro na busca: {e}")
+
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
