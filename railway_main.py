@@ -21,18 +21,35 @@ def health():
     return "OK", 200
 
 
-@app.route('/webhook', methods=['POST'])
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
+
+@app.route('/webhook', methods=['GET', 'POST', 'OPTIONS'])
 def webhook():
+    if request.method in ['GET', 'OPTIONS']:
+        return jsonify({"status": "ok"}), 200
     try:
         data = request.get_json(force=True, silent=True) or {}
+        print("[WEBHOOK] payload keys: " + str(list(data.keys())))
         messages = data.get('messages', [])
+        if not messages:
+            # Try alternative payload structures from W-API
+            msg = data.get('message', {})
+            if msg:
+                messages = [msg]
         for msg in messages:
-            from_id = msg.get('from', '')
-            text = (msg.get('body', '') or '').strip()
-            print("[MSG] from=" + str(from_id) + " text=" + str(text[:50]))
-            if from_id != GROUP_ID:
+            from_id = msg.get('from', '') or msg.get('chatId', '') or msg.get('groupId', '')
+            text = (msg.get('body', '') or msg.get('text', '') or msg.get('content', '') or '').strip()
+            print("[MSG] from=" + str(from_id) + " text=" + str(text[:80]))
+            if GROUP_ID not in from_id and from_id != GROUP_ID:
+                print("[SKIP] nao e o grupo alvo: " + str(from_id))
                 continue
-            if text == '/buscardocs':
+            if text.lower() in ['/buscardocs', 'buscardocs']:
                 user_sessions[from_id] = {'stage': 'cliente'}
                 send_msg(from_id, "Qual cliente voce procura? (nome ou CNPJ)")
             elif from_id in user_sessions:
@@ -69,14 +86,12 @@ def send_msg(to, body):
             print("[ERROR] WAPI_TOKEN nao configurado")
             return False
         resp = requests.post(
-            "https://api.w-api.app/v1/sendMessage",
-            json={"to": to, "body": body},
+            "https://api.w-api.app/v1/message/send-text?instanceId=" + WAPI_NUMBER,
+            json={"phone": to, "message": body},
             headers={"Authorization": "Bearer " + WAPI_TOKEN, "Content-Type": "application/json"},
             timeout=15
         )
-        print("[WAPI] status=" + str(resp.status_code))
-        if resp.status_code not in [200, 201]:
-            print("[WAPI] erro: " + resp.text[:200])
+        print("[WAPI] status=" + str(resp.status_code) + " body=" + resp.text[:100])
         return resp.status_code in [200, 201]
     except Exception as e:
         print("[ERROR] send_msg: " + str(e))
