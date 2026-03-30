@@ -35,10 +35,8 @@ def webhook():
         return jsonify({"status": "ok"}), 200
     try:
         data = request.get_json(force=True, silent=True) or {}
-        # Log full payload for debugging
         print("[WEBHOOK] payload: " + json.dumps(data)[:300])
 
-        # W-API payload structure: {message: {text, from, chat_id}} or {messages: [{body, from}]}
         msg = data.get('message', {})
         if msg:
             text = (msg.get('text') or msg.get('body') or '').strip()
@@ -55,13 +53,10 @@ def webhook():
 
         print("[MSG] from=" + str(from_id) + " chat=" + str(chat_id) + " text=" + str(text[:80]))
 
-        # Accept message if from or chat_id matches group
-        target = chat_id if GROUP_ID in chat_id else from_id
         if GROUP_ID not in from_id and GROUP_ID not in chat_id:
             print("[SKIP] nao e o grupo: from=" + from_id + " chat=" + chat_id)
             return jsonify({"status": "ok"}), 200
 
-        # Use group ID as session key
         session_key = GROUP_ID
 
         if text.lower() in ['/buscardocs', 'buscardocs']:
@@ -101,14 +96,14 @@ def send_msg(to, body):
             print("[ERROR] WAPI_TOKEN nao configurado")
             return False
         url = "https://api.w-api.app/v1/message/send-text"
-        payload = {"phone": to, "message": body}
+        payload = {"to": to, "body": body}
         headers = {
             "Authorization": "Bearer " + WAPI_TOKEN,
             "Content-Type": "application/json",
-            "instanceid": WAPI_NUMBER
+            "instanceid": WAPI_TOKEN
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        print("[WAPI] status=" + str(resp.status_code) + " body=" + resp.text[:150])
+        print("[WAPI] status=" + str(resp.status_code) + " resp=" + resp.text[:150])
         return resp.status_code in [200, 201]
     except Exception as e:
         print("[ERROR] send_msg: " + str(e))
@@ -137,7 +132,6 @@ def buscar_e_enviar(to, session):
         )
         svc = build('drive', 'v3', credentials=creds)
 
-        # Step 1: find client folder
         r = svc.files().list(
             q="'" + FOLDER_ID + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
             fields='files(id, name)', pageSize=100
@@ -149,7 +143,6 @@ def buscar_e_enviar(to, session):
         cliente_id = clientes[0]['id']
         cliente_nome = clientes[0]['name']
 
-        # Step 2: find year folder
         r = svc.files().list(
             q="'" + cliente_id + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
             fields='files(id, name)', pageSize=20
@@ -160,7 +153,6 @@ def buscar_e_enviar(to, session):
             return
         ano_id = anos[0]['id']
 
-        # Step 3: find month folder
         r = svc.files().list(
             q="'" + ano_id + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
             fields='files(id, name)', pageSize=20
@@ -172,7 +164,6 @@ def buscar_e_enviar(to, session):
             return
         mes_id = meses[0]['id']
 
-        # Step 4: find document type folder
         r = svc.files().list(
             q="'" + mes_id + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
             fields='files(id, name)', pageSize=20
@@ -181,15 +172,14 @@ def buscar_e_enviar(to, session):
         tipos_match = [f for f in tipos_lista if tipo.upper() in f['name'].upper()]
         if not tipos_match:
             opcoes = ", ".join([f['name'] for f in tipos_lista])
-            send_msg(to, "Tipo nao encontrado: " + tipo + "\nOpcoes disponiveis:\n" + opcoes)
+            send_msg(to, "Tipo nao encontrado: " + tipo + "\nOpcoes:\n" + opcoes)
             return
         tipo_id = tipos_match[0]['id']
         tipo_nome = tipos_match[0]['name']
 
-        # Step 5: list PDFs
         r = svc.files().list(
             q="'" + tipo_id + "' in parents and trashed=false",
-            fields='files(id, name, webViewLink, mimeType)', pageSize=50
+            fields='files(id, name, webViewLink)', pageSize=50
         ).execute()
         pdfs = r.get('files', [])
 
