@@ -1,4 +1,4 @@
-import os, json, threading
+import os, json, threading, time
 from flask import Flask, request, jsonify
 import requests
 
@@ -15,12 +15,18 @@ PORTAL_PASS = os.getenv('PORTAL_PASS', '373341')
 
 print(f"[OK] TOKEN={'sim' if TOKEN else 'NAO'} | NUMBER={'sim' if NUMBER else 'NAO'}")
 
-# Sessao HTTP com cookie - reutilizada entre chamadas
 _portal_session = requests.Session()
 _portal_logged_in = False
+_last_login_attempt = 0
 
 def portal_login():
-    global _portal_logged_in
+    global _portal_logged_in, _last_login_attempt
+    # Evita tentar relogar mais de uma vez por minuto
+    now = time.time()
+    if now - _last_login_attempt < 60:
+        print(f"[PORTAL] Aguardando cooldown de login ({int(60-(now-_last_login_attempt))}s)")
+        return _portal_logged_in
+    _last_login_attempt = now
     try:
         resp = _portal_session.post(
             f"{PORTAL}/api/auth/login",
@@ -117,15 +123,15 @@ def webhook():
         if s['stage'] == 'cliente':
             s['cliente'] = text
             s['stage']   = 'ano'
-            enviar(GROUP, f"Cliente: {text}\n\nQual ano? (ex: 2024 ou 2025)")
+            enviar(GROUP, f"Cliente: {text}. Qual ano? (ex: 2024 ou 2025)")
         elif s['stage'] == 'ano':
             s['ano']   = text
             s['stage'] = 'mes'
-            enviar(GROUP, f"Ano: {text}\n\nQual mes? (ex: 03 ou Marco)")
+            enviar(GROUP, f"Ano: {text}. Qual mes? (ex: 03 ou Marco)")
         elif s['stage'] == 'mes':
             s['mes']   = text
             s['stage'] = 'tipo'
-            enviar(GROUP, f"Mes: {text}\n\nQual tipo de documento?\n1. Obrigacoes\n2. Apuracao\n3. XML\n4. DESTDA\n5. Sped\n6. Outro")
+            enviar(GROUP, f"Mes: {text}. Qual tipo? 1.Obrigacoes 2.Apuracao 3.XML 4.DESTDA 5.Sped 6.Outro")
         elif s['stage'] == 'tipo':
             s['tipo'] = text
             enviar(GROUP, "Buscando documentos, aguarde...")
@@ -193,7 +199,7 @@ def buscar_drive(para, s):
         if not arquivos:
             enviar(para, f"Nenhum arquivo em {cnome} / {anome} / {nome_final}.")
             return
-        msg = f"{cnome} | {anome} / {nome_final}\n{len(arquivos)} arquivo(s):\n\n"
+        msg = f"{cnome} | {anome} / {nome_final} - {len(arquivos)} arquivo(s):\n\n"
         for f in arquivos[:8]:
             link = f.get('webViewLink', f"https://drive.google.com/file/d/{f['id']}/view")
             msg += f"{f['name']}\n{link}\n\n"
@@ -207,7 +213,6 @@ def buscar_drive(para, s):
 
 
 if __name__ == '__main__':
-    portal_login()
     port = int(os.getenv('PORT', 8080))
     print(f"[START] porta {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
