@@ -1,184 +1,147 @@
 import os
 import json
+import threading
 from flask import Flask, request, jsonify
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 import requests
 
 app = Flask(__name__)
 user_sessions = {}
-_drive_service = None
 
-FOLDER_ID = os.getenv('FOLDER_ID', '1uxLpoZ_oGYAymVBJzA60SH_ZVipFs3y5')
 WAPI_TOKEN = os.getenv('WAPI_TOKEN', '')
 WAPI_NUMBER = os.getenv('WAPI_NUMBER', '')
 GROUP_ID = os.getenv('GROUP_ID', '120363039812918773@g.us')
+FOLDER_ID = os.getenv('FOLDER_ID', '1uxLpoZ_oGYAymVBJzA60SH_ZVipFs3y5')
 
-print(f"[STARTUP] WAPI_TOKEN present: {bool(WAPI_TOKEN)}")
-print(f"[STARTUP] WAPI_NUMBER present: {bool(WAPI_NUMBER)}")
-print(f"[STARTUP] FOLDER_ID: {FOLDER_ID}")
-print(f"[STARTUP] GROUP_ID: {GROUP_ID}")
-
-
-def get_drive_service():
-    global _drive_service
-    if _drive_service is not None:
-        return _drive_service
-    try:
-        svc_json = os.getenv('SERVICE_ACCOUNT_JSON')
-        if not svc_json:
-            print("[WARN] SERVICE_ACCOUNT_JSON not set")
-            return None
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(svc_json),
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
-        )
-        _drive_service = build('drive', 'v3', credentials=creds)
-        print("[INFO] Google Drive service initialized")
-        return _drive_service
-    except Exception as e:
-        print(f"[ERROR] Drive service failed: {e}")
-        return None
+print("[STARTUP] WAPI_TOKEN: " + ("OK" if WAPI_TOKEN else "FALTANDO"))
+print("[STARTUP] WAPI_NUMBER: " + ("OK" if WAPI_NUMBER else "FALTANDO"))
 
 
 @app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({"status": "ok", "message": "Bot is running"}), 200
+def health():
+    return "OK", 200
 
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    print("[INFO] ===== Webhook received =====")
     try:
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            print("[WARN] No JSON data received")
-            return jsonify({"status": "ok"}), 200
-
-        print(f"[DEBUG] Keys: {list(data.keys())}")
-
+        data = request.get_json(force=True, silent=True) or {}
         messages = data.get('messages', [])
-        if not messages:
-            print("[INFO] No messages in payload")
-            return jsonify({"status": "ok"}), 200
-
         for msg in messages:
-            from_number = msg.get('from', '')
-            text = msg.get('body', '').strip()
-
-            print(f"[INFO] From: {from_number} | Text: {text}")
-
-            if from_number != GROUP_ID:
-                print(f"[INFO] Ignored (not from group)")
+            from_id = msg.get('from', '')
+            text = (msg.get('body', '') or '').strip()
+            print("[MSG] from=" + str(from_id) + " text=" + str(text[:50]))
+            if from_id != GROUP_ID:
                 continue
-
             if text == '/buscardocs':
-                user_sessions[from_number] = {'stage': 'cliente'}
-                send_message(from_number, "Qual cliente procura? (nome, codigo ou CNPJ)")
-
-            elif from_number in user_sessions:
-                session = user_sessions[from_number]
-                stage = session.get('stage')
-
+                user_sessions[from_id] = {'stage': 'cliente'}
+                send_msg(from_id, "Qual cliente voce procura? (nome ou CNPJ)")
+            elif from_id in user_sessions:
+                s = user_sessions[from_id]
+                stage = s.get('stage')
                 if stage == 'cliente':
-                    session['cliente'] = text
-                    session['stage'] = 'ano'
-                    send_message(from_number, f"Cliente: {text}\n\nQual ano? (ex: 2024)")
-
+                    s['cliente'] = text
+                    s['stage'] = 'ano'
+                    send_msg(from_id, "Cliente: " + text + "\nQual ano? (ex: 2024)")
                 elif stage == 'ano':
-                    session['ano'] = text
-                    session['stage'] = 'mes'
-                    send_message(from_number, f"Ano: {text}\n\nQual mes? (ex: 03)")
-
+                    s['ano'] = text
+                    s['stage'] = 'mes'
+                    send_msg(from_id, "Ano: " + text + "\nQual mes? (ex: 03)")
                 elif stage == 'mes':
-                    session['mes'] = text.zfill(2)
-                    session['stage'] = 'tipo'
-                    send_message(from_number, f"Mes: {session['mes']}\n\nQual tipo?\nNF, NF-e, Recibo, Relatorio ou Outro")
-
+                    s['mes'] = text.zfill(2)
+                    s['stage'] = 'tipo'
+                    send_msg(from_id, "Mes: " + s['mes'] + "\nQual tipo?\nNF / NF-e / Recibo / Relatorio / Outro")
                 elif stage == 'tipo':
-                    session['tipo'] = text
-                    send_message(from_number, "Buscando documentos, aguarde...")
-                    search_and_send_documents(from_number, session)
-                    del user_sessions[from_number]
-
+                    s['tipo'] = text
+                    send_msg(from_id, "Buscando documentos, aguarde...")
+                    t = threading.Thread(target=buscar_e_enviar, args=(from_id, dict(s)))
+                    t.daemon = True
+                    t.start()
+                    del user_sessions[from_id]
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print("[ERROR] webhook: " + str(e))
         return jsonify({"status": "ok"}), 200
 
-    except Exception as e:
-        print(f"[ERROR] Webhook exception: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"status": "error"}), 500
 
-
-def send_message(to, body):
+def send_msg(to, body):
     try:
         if not WAPI_TOKEN:
-            print("[ERROR] WAPI_TOKEN not set")
+            print("[ERROR] WAPI_TOKEN nao configurado")
             return False
-        url = "https://api.w-api.app/v1/sendMessage"
-        headers = {"Authorization": f"Bearer {WAPI_TOKEN}", "Content-Type": "application/json"}
-        payload = {"to": to, "body": body}
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        print(f"[INFO] W-API status: {resp.status_code}")
+        resp = requests.post(
+            "https://api.w-api.app/v1/sendMessage",
+            json={"to": to, "body": body},
+            headers={"Authorization": "Bearer " + WAPI_TOKEN, "Content-Type": "application/json"},
+            timeout=15
+        )
+        print("[WAPI] status=" + str(resp.status_code))
         if resp.status_code not in [200, 201]:
-            print(f"[ERROR] W-API body: {resp.text}")
+            print("[WAPI] erro: " + resp.text[:200])
         return resp.status_code in [200, 201]
     except Exception as e:
-        print(f"[ERROR] send_message: {e}")
+        print("[ERROR] send_msg: " + str(e))
         return False
 
 
-def search_and_send_documents(to, session):
+def buscar_e_enviar(to, session):
     try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
         cliente = session.get('cliente', '')
         ano = session.get('ano', '')
         mes = session.get('mes', '')
         tipo = session.get('tipo', '')
-        print(f"[INFO] Searching: {cliente} / {ano} / {mes} / {tipo}")
+        print("[BUSCA] " + cliente + " / " + ano + " / " + mes + " / " + tipo)
 
-        svc = get_drive_service()
-        if not svc:
-            send_message(to, "Google Drive nao configurado.")
+        svc_json = os.getenv('SERVICE_ACCOUNT_JSON')
+        if not svc_json:
+            send_msg(to, "Erro: SERVICE_ACCOUNT_JSON nao configurado.")
             return
 
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(svc_json),
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        svc = build('drive', 'v3', credentials=creds)
         results = []
 
         def traverse(folder_id, depth=0):
-            if depth > 8:
+            if depth > 8 or len(results) >= 10:
                 return
             try:
                 resp = svc.files().list(
-                    q=f"'{folder_id}' in parents and trashed=false",
+                    q="'" + folder_id + "' in parents and trashed=false",
                     fields='files(id, name, mimeType)',
                     pageSize=100
                 ).execute()
                 for f in resp.get('files', []):
                     name = f.get('name', '').lower()
-                    if (cliente.lower() in name and ano in name and
-                            mes in name and tipo.lower() in name):
-                        results.append({'name': f['name'], 'id': f['id']})
+                    terms = [k.lower() for k in [cliente, ano, mes, tipo] if k]
+                    if all(k in name for k in terms):
+                        results.append(f)
                     if f.get('mimeType') == 'application/vnd.google-apps.folder':
                         traverse(f['id'], depth + 1)
             except Exception as e:
-                print(f"[ERROR] traverse: {e}")
+                print("[ERROR] traverse: " + str(e))
 
         traverse(FOLDER_ID)
-        print(f"[INFO] Found {len(results)} docs")
+        print("[BUSCA] " + str(len(results)) + " encontrados")
 
         if results:
-            msg = f"{len(results)} documento(s) para {cliente} ({mes}/{ano}):\n\n"
+            msg = str(len(results)) + " documento(s) encontrado(s):\n\n"
             for d in results[:5]:
-                msg += f"- {d['name']}\nhttps://drive.google.com/file/d/{d['id']}/view\n\n"
-            send_message(to, msg)
+                msg += "- " + d['name'] + "\nhttps://drive.google.com/file/d/" + d['id'] + "/view\n\n"
+            send_msg(to, msg)
         else:
-            send_message(to, f"Nenhum documento encontrado para:\nCliente: {cliente}\nAno: {ano} / Mes: {mes}\nTipo: {tipo}")
+            send_msg(to, "Nenhum documento encontrado.\nCliente: " + cliente + " / Ano: " + ano + " / Mes: " + mes + " / Tipo: " + tipo)
 
     except Exception as e:
-        print(f"[ERROR] search_and_send: {e}")
-        send_message(to, f"Erro na busca: {e}")
+        print("[ERROR] buscar_e_enviar: " + str(e))
+        send_msg(to, "Erro ao buscar: " + str(e)[:100])
 
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
-    print(f"[STARTUP] Flask starting on port {port}")
+    print("[STARTUP] Rodando na porta " + str(port))
     app.run(host='0.0.0.0', port=port, debug=False)
