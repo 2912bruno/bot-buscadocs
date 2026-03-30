@@ -1,1 +1,1 @@
-web: gunicorn railway_main:app
+web: gunicorn railway_main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
