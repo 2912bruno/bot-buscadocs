@@ -1,203 +1,153 @@
-import os
-import json
-import threading
+import os, json, threading
 from flask import Flask, request, jsonify
 import requests
 
 app = Flask(__name__)
-user_sessions = {}
+sessions = {}
 
-WAPI_TOKEN = os.getenv('WAPI_TOKEN', '')
-WAPI_NUMBER = os.getenv('WAPI_NUMBER', '')
-GROUP_ID = os.getenv('GROUP_ID', '120363039812918773@g.us')
-FOLDER_ID = os.getenv('FOLDER_ID', '1uxLpoZ_oGYAymVBJzA60SH_ZVipFs3y5')
+TOKEN = os.getenv('WAPI_TOKEN', '')
+NUMBER = os.getenv('WAPI_NUMBER', '')
+GROUP  = os.getenv('GROUP_ID', '120363039812918773@g.us')
+FOLDER = os.getenv('FOLDER_ID', '1uxLpoZ_oGYAymVBJzA60SH_ZVipFs3y5')
 
-print("[STARTUP] WAPI_TOKEN: " + ("OK" if WAPI_TOKEN else "FALTANDO"))
-print("[STARTUP] WAPI_NUMBER: " + ("OK" if WAPI_NUMBER else "FALTANDO"))
-
+print(f"[OK] TOKEN={'sim' if TOKEN else 'NAO'} | NUMBER={'sim' if NUMBER else 'NAO'}")
 
 @app.route('/', methods=['GET'])
 def health():
     return "OK", 200
 
-
 @app.after_request
-def add_cors(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    return response
+def cors(r):
+    r.headers['Access-Control-Allow-Origin']  = '*'
+    r.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    r.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    return r
 
-
-@app.route('/webhook', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/webhook', methods=['GET','POST','OPTIONS'])
 def webhook():
-    if request.method in ['GET', 'OPTIONS']:
-        return jsonify({"status": "ok"}), 200
+    if request.method in ('GET','OPTIONS'):
+        return jsonify({"ok": True}), 200
+    raw = request.get_data(as_text=True)
+    print(f"[WEBHOOK] {raw[:400]}")
+    data = request.get_json(force=True, silent=True) or {}
+    msg = data.get('message', {})
+    if msg:
+        text    = (msg.get('text') or msg.get('body') or '').strip()
+        sender  = msg.get('from') or msg.get('chat_id') or ''
+        chat_id = msg.get('chat_id') or msg.get('from') or ''
+    else:
+        msgs = data.get('messages', [])
+        if not msgs:
+            return jsonify({"ok": True}), 200
+        m       = msgs[0]
+        text    = (m.get('body') or m.get('text') or '').strip()
+        sender  = m.get('from', '')
+        chat_id = sender
+    print(f"[MSG] from={sender} | chat={chat_id} | text={repr(text)}")
+    if GROUP not in sender and GROUP not in chat_id:
+        print(f"[SKIP] nao e o grupo")
+        return jsonify({"ok": True}), 200
+    key = GROUP
+    cmd = text.lower().strip('/')
+    if cmd == 'buscardocs':
+        sessions[key] = {'stage': 'cliente'}
+        enviar(GROUP, "Qual cliente voce procura? (nome ou CNPJ)")
+    elif key in sessions:
+        s = sessions[key]
+        if s['stage'] == 'cliente':
+            s['cliente'] = text
+            s['stage']   = 'ano'
+            enviar(GROUP, "Qual ano? (ex: 2024 ou 2025)")
+        elif s['stage'] == 'ano':
+            s['ano']   = text
+            s['stage'] = 'mes'
+            enviar(GROUP, "Qual mes? (ex: 03 ou Marco)")
+        elif s['stage'] == 'mes':
+            s['mes']   = text
+            s['stage'] = 'tipo'
+            enviar(GROUP, "Qual tipo?\n1. Obrigacoes\n2. Apuracao\n3. XML\n4. DESTDA\n5. Sped\n6. Outro")
+        elif s['stage'] == 'tipo':
+            s['tipo'] = text
+            enviar(GROUP, "Buscando documentos, aguarde...")
+            t = threading.Thread(target=buscar_drive, args=(GROUP, dict(s)), daemon=True)
+            t.start()
+            del sessions[key]
+    return jsonify({"ok": True}), 200
+
+def enviar(para, texto):
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        print("[WEBHOOK] payload: " + json.dumps(data)[:300])
-
-        msg = data.get('message', {})
-        if msg:
-            text = (msg.get('text') or msg.get('body') or '').strip()
-            from_id = msg.get('from', '') or msg.get('chat_id', '')
-            chat_id = msg.get('chat_id', '') or msg.get('from', '')
-        else:
-            messages = data.get('messages', [])
-            if not messages:
-                return jsonify({"status": "ok"}), 200
-            msg = messages[0]
-            text = (msg.get('body') or msg.get('text') or '').strip()
-            from_id = msg.get('from', '')
-            chat_id = from_id
-
-        print("[MSG] from=" + str(from_id) + " chat=" + str(chat_id) + " text=" + str(text[:80]))
-
-        if GROUP_ID not in from_id and GROUP_ID not in chat_id:
-            print("[SKIP] nao e o grupo: from=" + from_id + " chat=" + chat_id)
-            return jsonify({"status": "ok"}), 200
-
-        session_key = GROUP_ID
-
-        if text.lower() in ['/buscardocs', 'buscardocs']:
-            user_sessions[session_key] = {'stage': 'cliente'}
-            send_msg(GROUP_ID, "Qual cliente voce procura? (nome ou CNPJ)")
-        elif session_key in user_sessions:
-            s = user_sessions[session_key]
-            stage = s.get('stage')
-            if stage == 'cliente':
-                s['cliente'] = text
-                s['stage'] = 'ano'
-                send_msg(GROUP_ID, "Cliente: " + text + "\nQual ano? (ex: 2024 ou 2025)")
-            elif stage == 'ano':
-                s['ano'] = text
-                s['stage'] = 'mes'
-                send_msg(GROUP_ID, "Ano: " + text + "\nQual mes? (ex: 03 ou Marco)")
-            elif stage == 'mes':
-                s['mes'] = text
-                s['stage'] = 'tipo'
-                send_msg(GROUP_ID, "Mes: " + text + "\nQual tipo de documento?\n1. Obrigacoes\n2. Apuracao\n3. XML\n4. DESTDA\n5. Sped\n6. Outro")
-            elif stage == 'tipo':
-                s['tipo'] = text
-                send_msg(GROUP_ID, "Buscando documentos, aguarde...")
-                t = threading.Thread(target=buscar_e_enviar, args=(GROUP_ID, dict(s)))
-                t.daemon = True
-                t.start()
-                del user_sessions[session_key]
-        return jsonify({"status": "ok"}), 200
+        if not TOKEN:
+            print("[ERRO] TOKEN nao configurado")
+            return
+        resp = requests.post(
+            "https://api.w-api.app/v1/message/send-text",
+            json={"to": para, "body": texto},
+            headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json", "instanceid": TOKEN},
+            timeout=15
+        )
+        print(f"[WAPI] status={resp.status_code} resp={resp.text[:120]}")
     except Exception as e:
-        print("[ERROR] webhook: " + str(e))
-        return jsonify({"status": "ok"}), 200
+        print(f"[ERRO] enviar: {e}")
 
-
-def send_msg(to, body):
-    try:
-        if not WAPI_TOKEN:
-            print("[ERROR] WAPI_TOKEN nao configurado")
-            return False
-        url = "https://api.w-api.app/v1/message/send-text"
-        payload = {"to": to, "body": body}
-        headers = {
-            "Authorization": "Bearer " + WAPI_TOKEN,
-            "Content-Type": "application/json",
-            "instanceid": WAPI_TOKEN
-        }
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        print("[WAPI] status=" + str(resp.status_code) + " resp=" + resp.text[:150])
-        return resp.status_code in [200, 201]
-    except Exception as e:
-        print("[ERROR] send_msg: " + str(e))
-        return False
-
-
-def buscar_e_enviar(to, session):
+def buscar_drive(para, s):
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
-
-        cliente = session.get('cliente', '')
-        ano = session.get('ano', '')
-        mes = session.get('mes', '')
-        tipo = session.get('tipo', '')
-        print("[BUSCA] " + cliente + " / " + ano + " / " + mes + " / " + tipo)
-
-        svc_json = os.getenv('SERVICE_ACCOUNT_JSON')
+        svc_json = os.getenv('SERVICE_ACCOUNT_JSON', '')
         if not svc_json:
-            send_msg(to, "Erro: SERVICE_ACCOUNT_JSON nao configurado.")
+            enviar(para, "Erro: credenciais do Drive nao configuradas.")
             return
-
         creds = service_account.Credentials.from_service_account_info(
-            json.loads(svc_json),
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
-        )
+            json.loads(svc_json), scopes=['https://www.googleapis.com/auth/drive.readonly'])
         svc = build('drive', 'v3', credentials=creds)
-
-        r = svc.files().list(
-            q="'" + FOLDER_ID + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            fields='files(id, name)', pageSize=100
-        ).execute()
-        clientes = [f for f in r.get('files', []) if cliente.upper() in f['name'].upper()]
-        if not clientes:
-            send_msg(to, "Cliente nao encontrado: " + cliente)
+        cliente = s.get('cliente', '').strip()
+        ano     = s.get('ano', '').strip()
+        mes     = s.get('mes', '').strip()
+        tipo    = s.get('tipo', '').strip()
+        print(f"[DRIVE] buscando: {cliente} / {ano} / {mes} / {tipo}")
+        def listar(fid):
+            r = svc.files().list(q=f"'{fid}' in parents and trashed=false",
+                fields='files(id,name,mimeType,webViewLink)', pageSize=100).execute()
+            return r.get('files', [])
+        def achar_pasta(fid, nome):
+            for f in listar(fid):
+                if f['mimeType'] == 'application/vnd.google-apps.folder':
+                    if nome.upper() in f['name'].upper():
+                        return f['id'], f['name']
+            return None, None
+        cid, cnome = achar_pasta(FOLDER, cliente)
+        if not cid:
+            enviar(para, f"Cliente nao encontrado: {cliente}")
             return
-        cliente_id = clientes[0]['id']
-        cliente_nome = clientes[0]['name']
-
-        r = svc.files().list(
-            q="'" + cliente_id + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            fields='files(id, name)', pageSize=20
-        ).execute()
-        anos = [f for f in r.get('files', []) if ano in f['name']]
-        if not anos:
-            send_msg(to, "Ano nao encontrado: " + ano + " para " + cliente_nome)
+        aid, anome = achar_pasta(cid, ano)
+        if not aid:
+            enviar(para, f"Ano {ano} nao encontrado para {cnome}.")
             return
-        ano_id = anos[0]['id']
-
-        r = svc.files().list(
-            q="'" + ano_id + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            fields='files(id, name)', pageSize=20
-        ).execute()
-        meses = [f for f in r.get('files', []) if mes.upper() in f['name'].upper()]
-        if not meses:
-            opcoes = ", ".join([f['name'] for f in r.get('files', [])])
-            send_msg(to, "Mes nao encontrado: " + mes + "\nOpcoes: " + opcoes)
+        mid, mnome = achar_pasta(aid, mes)
+        if not mid:
+            existentes = [f['name'] for f in listar(aid) if f['mimeType'] == 'application/vnd.google-apps.folder']
+            enviar(para, f"Mes {mes} nao encontrado. Disponiveis: {', '.join(existentes)}")
             return
-        mes_id = meses[0]['id']
-
-        r = svc.files().list(
-            q="'" + mes_id + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            fields='files(id, name)', pageSize=20
-        ).execute()
-        tipos_lista = r.get('files', [])
-        tipos_match = [f for f in tipos_lista if tipo.upper() in f['name'].upper()]
-        if not tipos_match:
-            opcoes = ", ".join([f['name'] for f in tipos_lista])
-            send_msg(to, "Tipo nao encontrado: " + tipo + "\nOpcoes:\n" + opcoes)
+        tid, tnome = achar_pasta(mid, tipo)
+        pasta_final = tid if tid else mid
+        nome_final  = tnome if tnome else mnome
+        arquivos = [f for f in listar(pasta_final) if f['mimeType'] != 'application/vnd.google-apps.folder']
+        if not arquivos:
+            enviar(para, f"Nenhum arquivo em {cnome} / {anome} / {nome_final}.")
             return
-        tipo_id = tipos_match[0]['id']
-        tipo_nome = tipos_match[0]['name']
-
-        r = svc.files().list(
-            q="'" + tipo_id + "' in parents and trashed=false",
-            fields='files(id, name, webViewLink)', pageSize=50
-        ).execute()
-        pdfs = r.get('files', [])
-
-        if pdfs:
-            msg = "Documentos em '" + tipo_nome + "':\n\n"
-            for i, pdf in enumerate(pdfs[:10], 1):
-                link = pdf.get('webViewLink') or "https://drive.google.com/file/d/" + pdf['id'] + "/view"
-                msg += str(i) + ". " + pdf['name'] + "\n" + link + "\n\n"
-            send_msg(to, msg)
-        else:
-            send_msg(to, "Nenhum documento encontrado em " + tipo_nome)
-
+        msg = f"{cnome} | {anome} / {nome_final} - {len(arquivos)} arquivo(s):\n\n"
+        for f in arquivos[:8]:
+            link = f.get('webViewLink', f"https://drive.google.com/file/d/{f['id']}/view")
+            msg += f"{f['name']}\n{link}\n\n"
+        if len(arquivos) > 8:
+            msg += f"...e mais {len(arquivos)-8} arquivo(s)."
+        enviar(para, msg)
     except Exception as e:
-        print("[ERROR] buscar_e_enviar: " + str(e))
-        send_msg(to, "Erro ao buscar: " + str(e)[:150])
-
+        print(f"[ERRO] buscar_drive: {e}")
+        import traceback; traceback.print_exc()
+        enviar(para, f"Erro na busca: {e}")
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
-    print("[STARTUP] Rodando na porta " + str(port))
+    print(f"[START] porta {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
